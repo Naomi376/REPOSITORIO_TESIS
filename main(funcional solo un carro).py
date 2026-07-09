@@ -1,5 +1,60 @@
+# =============================================================================
+#  main.py  –  PISTA DE ARRANCONES  |  Red Malla NRF24L01
+#  Hardware  : Raspberry Pi Pico  +  NRF24L01  (x3)
+#              + RP2040 Zero con ST7789V2 en cada nodo esclavo
+# =============================================================================
+#  DETECCIÓN DE ROL POR HARDWARE
+#  ─────────────────────────────
+#  Conectar jumper/resistencia en GP20 y GP21 antes de energizar:
+#
+#    GP20   GP21  │  ROL
+#    ─────────────┼─────────────
+#    GND    GND   │  MAESTRO
+#    3.3V   GND   │  SALIDA
+#    GND    3.3V  │  META
+# =============================================================================
+#  PINOUT NRF24L01  (igual en los 3 Picos)
+#  ────────────────────────────────────────
+#  VCC  → 3.3V      GND  → GND
+#  CE   → GP6       CSN  → GP5
+#  SCK  → GP2       MOSI → GP3
+#  MISO → GP4
+# =============================================================================
+#  PINOUT PERIFÉRICOS
+#  ──────────────────
+#  MAESTRO  : BTN_START      → GP1   (pull-down, activo en HIGH)
+#             BTN_RESET      → GP0   (pull-down, activo en HIGH)
+#             LED_OK_SALIDA  → GP25  (verde onboard: radio salida viva)
+#             LED_OK_META    → GP24  (verde externo: radio meta viva)
+#
+#  SALIDA   : LED_ROJO       → GP15
+#             LED_AMARILLO   → GP14
+#             LED_VERDE      → GP13
+#             LED_ERROR      → GP10  (salida en falso)
+#             SENSOR_SALIDA  → GP1   (pull-down, activo en HIGH)
+#             UART TX (display) → GP8 (UART1 TX)
+#
+#  META     : SENSOR_META    → GP1   (pull-down, activo en HIGH)
+#             LED_ERROR      → GP7   (cruce prematuro)
+#             UART TX (display) → GP8 (UART1 TX)
+# =============================================================================
+#  PROTOCOLO UART → RP2040 Zero
+#  ─────────────────────────────
+#  Mensajes simples terminados en \n que el Zero interpreta:
+#    "PREPARAR\n"   → "¡ATENTOS! Semáforo inicia..."  (SALIDA)
+#                   → "Salida preparada"               (META)
+#    "ROJO\n"       → Semáforo ROJO encendido
+#    "AMARILLO\n"   → Semáforo AMARILLO encendido
+#    "VERDE\n"      → "¡VAMOOOOOS!"
+#    "FALSO\n"      → Salida en falso / Error
+#    "CRUCE\n"      → "Auto cruzó la meta"             (META)
+#    "RESET\n"      → "Sistema reseteado\nPista lista"
+#    "RADIO:1\n"    → Estado radio = ACTIVO
+#    "RADIO:0\n"    → Estado radio = SIN SEÑAL
+# =============================================================================
+
 import utime
-from machine import Pin, SPI, WDT
+from machine import Pin, SPI, WDT, UART
 from nrf24l01 import NRF24L01
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -12,10 +67,9 @@ TIMEOUT_RADIO_MS = 3000
 DEBOUNCE_MS      = 60
 WDT_MS           = 8000
 
-# Cuántas veces se repite cada mensaje crítico (sin ACK, compensamos con repetición)
 REPEAT_CRITICO   = 3
 REPEAT_HB        = 1
-PAUSA_REPEAT_MS  = 8    # pausa entre repeticiones del mismo mensaje
+PAUSA_REPEAT_MS  = 8
 
 ADDR_MAESTRO  = b'MST01'
 ADDR_SALIDA   = b'SLD01'
@@ -74,37 +128,64 @@ def detectar_rol():
 # ─────────────────────────────────────────────────────────────────────────────
 #  HELPERS
 # ─────────────────────────────────────────────────────────────────────────────
-def build_payload(msg_id, valor_ms=0):
+def build_payload(msg_id, valor_us=0):
+    """
+    Payload de 16 bytes.
+    Los bytes 1-4 ahora llevan microsegundos (uint32).
+    """
     buf    = bytearray(PAYLOAD_SIZE)
     buf[0] = msg_id
-    buf[1] = (valor_ms      ) & 0xFF
-    buf[2] = (valor_ms >>  8) & 0xFF
-    buf[3] = (valor_ms >> 16) & 0xFF
-    buf[4] = (valor_ms >> 24) & 0xFF
+    buf[1] = (valor_us      ) & 0xFF
+    buf[2] = (valor_us >>  8) & 0xFF
+    buf[3] = (valor_us >> 16) & 0xFF
+    buf[4] = (valor_us >> 24) & 0xFF
     return bytes(buf)
 
 def parse_payload(data):
     if len(data) < 5:
         return 0, 0
     msg_id   = data[0]
-    valor_ms = data[1] | (data[2] << 8) | (data[3] << 16) | (data[4] << 24)
-    return msg_id, valor_ms
+    valor_us = data[1] | (data[2] << 8) | (data[3] << 16) | (data[4] << 24)
+    return msg_id, valor_us
+
+def us_a_str(us):
+    """Convierte microsegundos a MM:SS.mmm (milisegundos en display)."""
+    ms         = us // 1000
+    milisimas  = ms % 1000
+    segundos   = (ms // 1000) % 60
+    minutos    = (ms // 1000) // 60
+    return "{:02d}:{:02d}.{:03d}".format(minutos, segundos, milisimas)
 
 def ms_a_str(ms):
-    cs         = ms // 10
-    centesimas = cs % 100
-    segundos   = (cs // 100) % 60
-    minutos    = (cs // 100) // 60
-    return "{:02d}:{:02d}.{:02d}".format(minutos, segundos, centesimas)
+    """Compatibilidad: convierte ms a MM:SS.mmm."""
+    return us_a_str(ms * 1000)
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  UART para pantalla (UART1: TX=GP8, RX=GP9 — solo usamos TX)
+# ─────────────────────────────────────────────────────────────────────────────
+def init_uart_display():
+    """Inicializa UART1 para comunicación con RP2040 Zero."""
+    try:
+        uart = UART(1, baudrate=115200, tx=Pin(8), rx=Pin(9))
+        utime.sleep_ms(50)
+        return uart
+    except Exception as e:
+        print("[UART] Error init:", e)
+        return None
+
+def display_send(uart, msg):
+    """Envía un mensaje al display por UART."""
+    if uart is None:
+        return
+    try:
+        uart.write(msg + "\n")
+    except Exception as e:
+        print("[UART] Error enviando '{}': {}".format(msg, e))
 
 # ─────────────────────────────────────────────────────────────────────────────
 #  RADIO  –  sin ACK (send_start) para evitar colisiones con heartbeats
 # ─────────────────────────────────────────────────────────────────────────────
 def init_radio(addr_rx):
-    """
-    Inicializa el NRF24L01 en modo NO-ACK.
-    addr_rx : dirección en la que este nodo escucha.
-    """
     CE  = Pin(6, Pin.OUT, value=0)
     CSN = Pin(5, Pin.OUT, value=1)
 
@@ -130,24 +211,18 @@ def init_radio(addr_rx):
 
 
 def enviar(radio, addr_rx_propia, addr_dest, msg_id, valor=0, repeticiones=REPEAT_CRITICO):
-    """
-    Envío sin ACK usando send_start() / send_done().
-    - Cambia a TX, envía N veces el mismo mensaje con pequeña pausa,
-      luego vuelve a RX.  No bloquea esperando confirmación.
-    - addr_rx_propia: pipe RX de este nodo (para restaurar al terminar).
-    """
-    payload = build_payload(msg_id, valor)
+    payload  = build_payload(msg_id, valor)
     enviados = 0
     try:
         radio.stop_listening()
         radio.open_tx_pipe(addr_dest)
-        utime.sleep_ms(3)                   # settling
+        utime.sleep_ms(3)
 
         for _ in range(repeticiones):
             try:
-                radio.send_start(payload)   # no-blocking, no espera ACK
+                radio.send_start(payload)
                 utime.sleep_ms(PAUSA_REPEAT_MS)
-                radio.send_done()           # libera el buffer TX
+                radio.send_done()
                 enviados += 1
             except Exception as e:
                 print("[RF] send error msg={}: {}".format(msg_id, e))
@@ -156,7 +231,6 @@ def enviar(radio, addr_rx_propia, addr_dest, msg_id, valor=0, repeticiones=REPEA
     except Exception as e:
         print("[RF] Error TX setup msg={}: {}".format(msg_id, e))
     finally:
-        # Siempre restaurar a modo RX
         try:
             radio.open_rx_pipe(1, addr_rx_propia)
             radio.start_listening()
@@ -166,7 +240,7 @@ def enviar(radio, addr_rx_propia, addr_dest, msg_id, valor=0, repeticiones=REPEA
     return enviados > 0
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  NODO MAESTRO
+#  NODO MAESTRO  (sin pantalla, sin UART — igual que antes)
 # ─────────────────────────────────────────────────────────────────────────────
 def run_maestro():
     print("=" * 44)
@@ -186,9 +260,9 @@ def run_maestro():
         return enviar(radio, ADDR_MAESTRO, addr, msg, val, rep)
 
     estado           = S_IDLE
-    t_inicio_ms      = 0
-    t_fin_ms         = 0
-    ultimo_hb_salida = utime.ticks_ms() - TIMEOUT_RADIO_MS   # inicia como "sin señal"
+    t_inicio_us      = 0
+    t_fin_us         = 0
+    ultimo_hb_salida = utime.ticks_ms() - TIMEOUT_RADIO_MS
     ultimo_hb_meta   = utime.ticks_ms() - TIMEOUT_RADIO_MS
     ultimo_start     = 0
     ultimo_reset     = 0
@@ -235,8 +309,8 @@ def run_maestro():
                     tx(ADDR_SALIDA, MSG_RESET)
                     tx(ADDR_META,   MSG_RESET)
                     estado      = S_IDLE
-                    t_inicio_ms = 0
-                    t_fin_ms    = 0
+                    t_inicio_us = 0
+                    t_fin_us    = 0
                     print("[MAESTRO] Reiniciado. Listo para nueva carrera.\n")
 
             # ── Recepción ──────────────────────────────────────────────────
@@ -253,17 +327,19 @@ def run_maestro():
                             ultimo_hb_meta = ahora
 
                     elif msg_id == MSG_START_CRONO and estado == S_LISTO:
-                        t_inicio_ms = ahora
+                        # El valor recibido NO se usa aquí; el Maestro mide su propio tiempo
+                        # (el tiempo de carrera se calcula en el nodo META con mayor precisión)
+                        t_inicio_us = utime.ticks_us()
                         estado      = S_CORRIENDO
                         print("[MAESTRO] >>> CARRERA INICIADA <<<")
 
                     elif msg_id == MSG_FINISH and estado == S_CORRIENDO:
-                        t_fin_ms   = ahora
-                        t_total_ms = utime.ticks_diff(t_fin_ms, t_inicio_ms)
+                        # valor contiene los microsegundos medidos por el nodo META
+                        t_total_us = valor
                         estado     = S_FINISH
-                        print("\n[MAESTRO] ╔══════════════════════════╗")
-                        print("[MAESTRO] ║  TIEMPO FINAL: {}  ║".format(ms_a_str(t_total_ms)))
-                        print("[MAESTRO] ╚══════════════════════════╝")
+                        print("\n[MAESTRO] ╔══════════════════════════════╗")
+                        print("[MAESTRO] ║  TIEMPO FINAL: {}  ║".format(us_a_str(t_total_us)))
+                        print("[MAESTRO] ╚══════════════════════════════╝")
 
                     elif msg_id == MSG_ERROR_FALSO:
                         estado = S_ERROR
@@ -276,8 +352,8 @@ def run_maestro():
             if estado == S_CORRIENDO:
                 if utime.ticks_diff(ahora, t_ultimo_print) >= 100:
                     t_ultimo_print = ahora
-                    elapsed = utime.ticks_diff(ahora, t_inicio_ms)
-                    print("\r[CRONO] {} ".format(ms_a_str(elapsed)), end="")
+                    elapsed_us = utime.ticks_diff(utime.ticks_us(), t_inicio_us)
+                    print("\r[CRONO] {} ".format(us_a_str(elapsed_us)), end="")
 
         except Exception as e:
             print("[MAESTRO] Excepción loop:", e)
@@ -300,6 +376,10 @@ def run_salida():
     led_error    = Pin(10, Pin.OUT, value=0)
     sensor       = Pin(1,  Pin.IN,  Pin.PULL_DOWN)
 
+    # UART hacia RP2040 Zero con pantalla (GP8=TX, GP9=RX)
+    uart_display = init_uart_display()
+    display_send(uart_display, "BOOT_SALIDA")   # notifica arranque al display
+
     radio = init_radio(ADDR_SALIDA)
 
     def tx(addr, msg, val=0, rep=REPEAT_CRITICO):
@@ -308,15 +388,18 @@ def run_salida():
     estado           = S_IDLE
     t_sema           = 0
     sensor_disparado = False
+    t_sensor_us      = 0          # timestamp en µs capturado en ISR
     t_ultimo_hb      = utime.ticks_ms()
     t_ultimo_sensor  = 0
+    ultimo_estado_radio = None    # para actualizar display solo cuando cambia
 
     def isr_sensor(pin):
-        nonlocal sensor_disparado, t_ultimo_sensor
-        ahora = utime.ticks_ms()
-        if utime.ticks_diff(ahora, t_ultimo_sensor) > DEBOUNCE_MS:
+        nonlocal sensor_disparado, t_ultimo_sensor, t_sensor_us
+        ahora_ms = utime.ticks_ms()
+        if utime.ticks_diff(ahora_ms, t_ultimo_sensor) > DEBOUNCE_MS:
+            t_sensor_us      = utime.ticks_us()   # captura precisa en µs
             sensor_disparado = True
-            t_ultimo_sensor  = ahora
+            t_ultimo_sensor  = ahora_ms
 
     def apagar_semaforo():
         led_rojo.value(0); led_amarillo.value(0)
@@ -343,8 +426,14 @@ def run_salida():
 
             # ── Heartbeat ──────────────────────────────────────────────────
             if utime.ticks_diff(ahora, t_ultimo_hb) >= HEARTBEAT_MS:
-                tx(ADDR_MAESTRO, MSG_HEARTBEAT, ROL_SALIDA, REPEAT_HB)
+                ok = tx(ADDR_MAESTRO, MSG_HEARTBEAT, ROL_SALIDA, REPEAT_HB)
                 t_ultimo_hb = utime.ticks_ms()
+
+                # Actualizar indicador de radio en display (solo si cambia)
+                radio_activo = 1   # si pudo enviar HB, asumimos radio OK
+                if radio_activo != ultimo_estado_radio:
+                    display_send(uart_display, "RADIO:{}".format(radio_activo))
+                    ultimo_estado_radio = radio_activo
 
             # ── Recepción ──────────────────────────────────────────────────
             if radio.any():
@@ -359,23 +448,24 @@ def run_salida():
                         led_rojo.value(1)
                         estado = S_ROJO
                         t_sema = utime.ticks_ms()
-                        hab_sensor()   # FIX: sensor activo desde ROJO para detectar salida en falso
-                        
+                        hab_sensor()
+                        display_send(uart_display, "PREPARAR")
+
                     elif msg_id == MSG_ERROR_FALSO:
                         print("[SALIDA] ERROR_FALSO recibido desde META → semáforo error")
                         dis_sensor()
-                        semaforo_error()   # prende todos los LEDs del semáforo + led_error GP10
+                        semaforo_error()
                         sensor_disparado = False
-                        estado = S_ERROR                           
-
+                        estado = S_ERROR
+                        display_send(uart_display, "FALSO")
 
                     elif msg_id == MSG_RESET:
                         print("[SALIDA] RESET → IDLE")
                         dis_sensor(); apagar_semaforo()
                         sensor_disparado = False
                         estado = S_IDLE
-                        
-                      
+                        display_send(uart_display, "RESET")
+
                 except Exception as e:
                     print("[SALIDA] Error RX:", e)
 
@@ -385,14 +475,15 @@ def run_salida():
                     led_rojo.value(0); led_amarillo.value(1)
                     estado = S_AMARILLO; t_sema = ahora
                     print("[SALIDA] → AMARILLO")
+                    display_send(uart_display, "AMARILLO")
 
             elif estado == S_AMARILLO:
                 if utime.ticks_diff(ahora, t_sema) >= T_AMARILLO_MS:
                     led_amarillo.value(0); led_verde.value(1)
                     sensor_disparado = False
-                    # sensor ya estaba activo desde S_ROJO, solo cambiamos estado
                     estado = S_VERDE
                     print("[SALIDA] → VERDE  |  Sensor ACTIVO")
+                    display_send(uart_display, "VERDE")
 
             # ── Sensor disparado ───────────────────────────────────────────
             if sensor_disparado:
@@ -401,6 +492,7 @@ def run_salida():
 
                 if estado == S_VERDE:
                     print("[SALIDA] Cruce VÁLIDO → START_CRONO + ARM_META")
+                    # Enviamos el timestamp de cruce al Maestro (solo referencia, no se usa en tiempo)
                     tx(ADDR_MAESTRO, MSG_START_CRONO)
                     tx(ADDR_META,    MSG_ARM_META)
                     estado = S_ARRANCADO
@@ -409,8 +501,9 @@ def run_salida():
                     print("[SALIDA] !! SALIDA EN FALSO")
                     semaforo_error()
                     tx(ADDR_MAESTRO, MSG_ERROR_FALSO)
-                    tx(ADDR_META,    MSG_ERROR_FALSO)   # FIX: Meta también prende su LED error
+                    tx(ADDR_META,    MSG_ERROR_FALSO)
                     estado = S_ERROR
+                    display_send(uart_display, "FALSO")
 
         except Exception as e:
             print("[SALIDA] Excepción loop:", e)
@@ -430,6 +523,10 @@ def run_meta():
     sensor_meta = Pin(1, Pin.IN, Pin.PULL_DOWN)
     led_error   = Pin(7, Pin.OUT, value=0)
 
+    # UART hacia RP2040 Zero con pantalla (GP8=TX, GP9=RX)
+    uart_display = init_uart_display()
+    display_send(uart_display, "BOOT_META")    # notifica arranque al display
+
     radio = init_radio(ADDR_META)
 
     def tx(addr, msg, val=0, rep=REPEAT_CRITICO):
@@ -437,16 +534,19 @@ def run_meta():
 
     estado           = M_IDLE
     sensor_disparado = False
-    t_arm            = 0
+    t_arm_us         = 0          # timestamp en µs cuando llega ARM_META
+    t_sensor_us      = 0          # timestamp en µs capturado en ISR
     t_ultimo_hb      = utime.ticks_ms()
     t_ultimo_sensor  = 0
+    ultimo_estado_radio = None
 
     def isr_meta(pin):
-        nonlocal sensor_disparado, t_ultimo_sensor
-        ahora = utime.ticks_ms()
-        if utime.ticks_diff(ahora, t_ultimo_sensor) > DEBOUNCE_MS:
+        nonlocal sensor_disparado, t_ultimo_sensor, t_sensor_us
+        ahora_ms = utime.ticks_ms()
+        if utime.ticks_diff(ahora_ms, t_ultimo_sensor) > DEBOUNCE_MS:
+            t_sensor_us      = utime.ticks_us()   # captura precisa en µs
             sensor_disparado = True
-            t_ultimo_sensor  = ahora
+            t_ultimo_sensor  = ahora_ms
 
     def dis_sensor():
         try: sensor_meta.irq(handler=None)
@@ -465,8 +565,13 @@ def run_meta():
 
             # ── Heartbeat ──────────────────────────────────────────────────
             if utime.ticks_diff(ahora, t_ultimo_hb) >= HEARTBEAT_MS:
-                tx(ADDR_MAESTRO, MSG_HEARTBEAT, ROL_META, REPEAT_HB)
+                ok = tx(ADDR_MAESTRO, MSG_HEARTBEAT, ROL_META, REPEAT_HB)
                 t_ultimo_hb = utime.ticks_ms()
+
+                radio_activo = 1
+                if radio_activo != ultimo_estado_radio:
+                    display_send(uart_display, "RADIO:{}".format(radio_activo))
+                    ultimo_estado_radio = radio_activo
 
             # ── Recepción ──────────────────────────────────────────────────
             if radio.any():
@@ -479,23 +584,26 @@ def run_meta():
                         dis_sensor(); sensor_disparado = False
                         led_error.value(0); estado = M_PREPARADO
                         hab_sensor()
+                        display_send(uart_display, "PREPARAR")
 
                     elif msg_id == MSG_ARM_META and estado == M_PREPARADO:
                         print("[META] ARM_META → sensor ARMADO")
                         sensor_disparado = False
-                        t_arm = utime.ticks_ms()
+                        t_arm_us = utime.ticks_us()   # marca de tiempo precisa en µs
                         hab_sensor(); estado = M_ARMADO
 
                     elif msg_id == MSG_ERROR_FALSO:
                         print("[META] ERROR_FALSO recibido → LED error ON")
                         dis_sensor(); sensor_disparado = False
-                        led_error.value(1)   # FIX: prender LED error en Meta
+                        led_error.value(1)
                         estado = M_ERROR
+                        display_send(uart_display, "FALSO")
 
                     elif msg_id == MSG_RESET:
                         print("[META] RESET → IDLE")
                         dis_sensor(); sensor_disparado = False
                         led_error.value(0); estado = M_IDLE
+                        display_send(uart_display, "RESET")
 
                 except Exception as e:
                     print("[META] Error RX:", e)
@@ -504,22 +612,24 @@ def run_meta():
             if sensor_disparado:
                 sensor_disparado = False
                 dis_sensor()
-                t_cruce = utime.ticks_ms()
 
                 if estado == M_ARMADO:
-                    t_carrera = utime.ticks_diff(t_cruce, t_arm)
-                    print("[META] FINISH  tiempo: {}".format(ms_a_str(t_carrera)))
-                    tx(ADDR_MAESTRO, MSG_FINISH, t_carrera)
+                    # Tiempo medido completamente en µs dentro del nodo Meta
+                    # → máxima precisión posible sin latencia de red
+                    t_carrera_us = utime.ticks_diff(t_sensor_us, t_arm_us)
+                    print("[META] FINISH  tiempo: {}".format(us_a_str(t_carrera_us)))
+                    tx(ADDR_MAESTRO, MSG_FINISH, t_carrera_us)
                     estado = M_REGISTRADO
+                    display_send(uart_display, "CRUCE")
 
                 elif estado == M_PREPARADO:
                     print("[META] !! ERROR: cruce prematuro en META")
                     led_error.value(1)
                     tx(ADDR_MAESTRO, MSG_ERROR_FALSO)
-                    tx(ADDR_SALIDA,  MSG_ERROR_FALSO)   # Salida prende semáforo error
+                    tx(ADDR_SALIDA,  MSG_ERROR_FALSO)
                     estado = M_ERROR
-                    
-                    
+                    display_send(uart_display, "FALSO")
+
         except Exception as e:
             print("[META] Excepción loop:", e)
             utime.sleep_ms(100)
@@ -536,4 +646,3 @@ def main():
     elif rol == ROL_META:    run_meta()
 
 main()
-
